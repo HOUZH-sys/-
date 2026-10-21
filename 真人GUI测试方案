@@ -1,0 +1,920 @@
+# macOS 原生游戏后台 GUI 自动化测试手册
+
+适用对象：Godot 4 或其他有原生窗口的游戏项目；希望让独立测试 Agent
+在后台启动真实游戏、操作鼠标键盘、读取截图并判断 PASS / FAIL，同时尽量
+不打断主账户日常使用、不把大量截图上下文发送给模型。
+
+本文以 Looped Vows 的 macOS 实现为参考，但所有账户密码、API Key、会话 ID、
+个人目录和认证文件都应替换成本机自己的安全配置，不能复制本文之外的聊天记录
+或凭据。
+
+---
+
+## 1. 先说结论
+
+这套方案的核心不是“多开一个屏幕”，而是：
+
+1. 在 macOS 中建立独立的非管理员账户 `godot-test`。
+2. 在该账户的图形登录会话中运行单实例 bridge。
+3. 主账户只负责开发、Headless 测试、构建和发布候选包。
+4. bridge 从共享队列领取任务，在 `godot-test` 会话里启动真实游戏。
+5. 测试 Agent 不直接碰主账户桌面，只通过 bridge 获取结果。
+6. GUI 操作采用两层通道：
+   - Accessibility / 键盘：CuaDriver 以 `background` 模式投递到目标窗口。
+   - 卡牌拖动等 Canvas 输入：游戏自己的 test-mode 输入桥生成真实 InputEvent。
+7. 截图由游戏窗口自己渲染输出，不依赖当前活动控制台截屏。
+8. 原始截图留在本地私有目录；模型每轮最多读取一张汇总图
+   `contact-sheet.jpg`，避免十几张 1280×720 PNG 造成请求过大。
+
+macOS 只有一个活动控制台。额外接一块显示器不会凭空得到第二个活动桌面；
+真正解决问题的是“后台账户会话 + 窗口定向输入 + 应用自渲染证据”，不是副屏。
+
+---
+
+## 2. 它是不是真正的 GUI 测试
+
+是，但必须诚实说明边界。
+
+本方案确实会：
+
+- 启动导出后的真实 `.app`。
+- 创建真实 macOS 窗口和真实渲染帧。
+- 读取真实 Accessibility 树和窗口几何。
+- 发送鼠标点击、键盘 Tab / Enter / Escape。
+- 在游戏真实拖放管线中注入鼠标按下、移动和释放事件。
+- 从实际运行中的游戏视口输出截图。
+- 根据截图、窗口状态、游戏状态和输入结果共同判断 PASS / FAIL。
+
+它不是：
+
+- 让语言模型“想象”自己点过按钮。
+- 用 Headless 测试冒充 GUI 验收。
+- 虚拟显示器的等价物。
+- 对所有游戏都天然可用的黑盒方案。
+
+对于 Godot、Unity、自绘 Canvas 或不标准控件，macOS 后台会话可能丢弃
+面向全局桌面的 Canvas 鼠标事件。此时需要应用提供测试输入桥，或者使用
+引擎自身的事件注入接口。CuaDriver 仍负责窗口、Accessibility、键盘和
+上下文，但不假装全局 Canvas 事件一定会成功。
+
+---
+
+## 3. 总体架构
+
+```text
+主账户：日常桌面
+┌──────────────────────────────────────────────────────────────┐
+│ 开发 Agent / 主管                                            │
+│   │                                                          │
+│   ├─ Headless check.sh                                      │
+│   ├─ 导出 .app + 生成 manifest / SHA-256                    │
+│   ├─ 原子发布只读候选构建                                    │
+│   └─ 写入 queue/job.json                                    │
+└──────────────────────────────┬───────────────────────────────┘
+                               │ 共享目录
+                               ▼
+/Users/Shared/godot-playtest
+┌──────────────────────────────────────────────────────────────┐
+│ builds/      已发布、只读、带指纹的游戏构建                  │
+│ queue/      待领取任务                                       │
+│ processed/  已领取任务记录                                   │
+│ results/    结果、状态、日志、联系表和私有原始截图            │
+│ runtime/    bridge、CuaDriver 入口、测试脚本                 │
+└──────────────────────────────┬───────────────────────────────┘
+                               │ 单实例轮询
+                               ▼
+godot-test 后台图形会话
+┌──────────────────────────────────────────────────────────────┐
+│ LaunchAgent: com.codex.godot-playtest                        │
+│   │                                                          │
+│   └─ bridge.sh                                               │
+│       ├─ 校验 job / app / manifest / SHA                     │
+│       ├─ 启动真实 .app                                       │
+│       ├─ CuaDriver 查找 PID、窗口、AX 元素                   │
+│       ├─ 键盘 / AX click 使用 background delivery            │
+│       ├─ 应用 test-mode 导出截图和状态                       │
+│       └─ 写出 result.json / vision.json / contact-sheet.jpg  │
+└──────────────────────────────────────────────────────────────┘
+```
+
+正常工作时，测试账户可以处于“已登录但非当前控制台”的状态。主账户继续
+使用键盘、鼠标和前台应用；测试 bridge 只把输入定向到指定 PID / 窗口。
+结果会记录测试前后 `/dev/console` 的用户，若控制台发生变化，应视为隔离失败。
+
+---
+
+## 4. 为什么不用全局鼠标事件
+
+早期失败模式通常是：
+
+- CuaDriver 能点击普通按钮。
+- 但游戏角色、卡牌或 Canvas 不接受键盘和鼠标移动。
+- 事件看起来“发送成功”，实际被后台会话丢弃。
+
+根因是 macOS 对不同 GUI 会话、Canvas 和全局输入的限制，不是模型不会操作。
+
+最小化、最稳定的解决方式是混合方案：
+
+1. 普通按钮、焦点和文本：走真实 Accessibility 元素。
+2. Tab、Enter、Escape：走窗口定向键盘事件。
+3. 卡牌拖动和 Canvas 坐标操作：应用暴露只在本机测试模式开启的输入请求文件。
+4. 测试脚本从游戏导出的真实控件矩形取坐标，不写死像素位置。
+5. 游戏通过 `Viewport.push_input()` 产生真实 `InputEventMouseMotion` 和
+   `InputEventMouseButton`，让原拖放逻辑处理。
+6. 操作后再用游戏状态、Accessibility 和实际截图三重确认。
+
+这仍然是真实运行的真实窗口和真实拖放代码，但明确区分了“操作系统级全局拖动”
+和“应用内输入桥”，不会把后台 Canvas 限制说成已经消失。
+
+---
+
+## 5. 安全模型
+
+### 5.1 保护边界
+
+- CuaDriver 是带 Accessibility 和 Screen Recording 权限的高权限工具。
+- 只在 `godot-test` 标准用户中授权，不在主账户授权。
+- `godot-test` 不加入 `admin`，不授予 Full Disk Access。
+- 测试账户不登录 iCloud、邮箱、浏览器同步、密码管理器或公司 VPN。
+- 测试账户只拥有低价值、可丢弃的本地游戏状态。
+- 主仓库和构建脚本留在主账户；测试账户只读取共享候选包。
+
+这不是虚拟机级别沙箱。两个 macOS 账户仍共享内核和硬件。如果要测试来源不明的
+代码，应该使用独立物理测试机或 VM；本方案主要解决“日常桌面不被 GUI 操作打断”
+和“测试结果可重复”，不应宣传为恶意软件隔离。
+
+### 5.2 凭据
+
+共享目录、job JSON、结果和截图里都不应出现：
+
+- API Key。
+- 账户密码。
+- GitHub Token。
+- iCloud / 邮箱凭据。
+- 签名证书私钥。
+- `.env`、shell history 或 auth 文件。
+
+测试 Agent 只需要：
+
+- 构建 ID。
+- `.app` 路径。
+- manifest。
+- 可执行文件和 PCK 的 SHA-256。
+- 结果目录。
+
+### 5.3 文件权限
+
+参考实现使用：
+
+- `queue/`、`processed/`、`results/`：sticky writable，允许主账户投递、
+  测试账户领取。
+- `builds/`：主账户发布，候选构建发布后移除写权限。
+- `runtime/`：普通只读执行目录。
+- 原始 PNG：先移入 `raw/`，文件设为 `0600`，目录设为 `0700`。
+- `contact-sheet.jpg`：可交给测试 Agent 的单张汇总证据。
+
+共享目录的 `1777` 适合受信的单机单用户环境。多人共用机器时应进一步改成
+专用 group + ACL，并限制谁能投递队列。
+
+### 5.4 分享结果前
+
+`result.json` 可能包含当前控制台用户名、绝对共享路径、窗口 PID、完整游戏状态
+和输入动作。对外分享时不要直接打包整个结果目录。
+
+建议只分享：
+
+- `contact-sheet.jpg`。
+- 经过筛选的紧凑摘要。
+- 必要且已裁剪的单个截图。
+
+示例：
+
+```bash
+jq '{
+  status,
+  error,
+  build_id,
+  ui_state,
+  stamina,
+  board_counts,
+  placements,
+  save_slots,
+  last_action
+}' result.json > share-summary.json
+```
+
+不要分享：
+
+- `raw/`
+- shell history
+- CuaDriver 或 LaunchAgent 的原始日志
+- 包含个人路径、用户名、游戏存档或窗口标题的未清洗 JSON
+
+---
+
+## 6. 已验证的版本基线
+
+当前参考环境验证于：
+
+| 组件 | 版本 / 状态 |
+|---|---|
+| macOS | 15.8.1，Intel `x86_64` |
+| Godot | 4.7.2 stable，official |
+| CuaDriver | 0.35.4 |
+| Python | 系统 `/usr/bin/python3` |
+| jq | 系统 `/usr/bin/jq` |
+| Swift | 系统 Command Line Tools 提供 |
+
+Godot 和 CuaDriver 的官方压缩包、SHA、签名验证记录见
+[`SECURITY.md`](SECURITY.md)。
+
+Apple Silicon 通常可以运行 Godot 和 CuaDriver 的 universal 二进制，但本参考
+机器没有在 Apple Silicon 上重新完成完整 GUI 验收。迁移到新架构时必须重新跑
+一遍权限、启动、截图和输入验证，不能仅凭二进制包含 `arm64` 就宣称已验证。
+
+---
+
+## 7. 新机安装步骤
+
+以下命令中的 `<REPO_ROOT>` 代表项目 Git 克隆目录。不要把个人主目录硬编码到
+共享脚本或文档中。
+
+### 7.1 系统准备
+
+1. 更新 macOS 并重启。
+2. 安装 Xcode Command Line Tools：
+
+```bash
+xcode-select --install
+```
+
+3. 检查基础命令：
+
+```bash
+command -v git jq python3 swift sips ditto codesign osascript sudo caffeinate
+```
+
+4. 保证机器接通电源，并允许 App 后台运行。运行时建议在主账户使用：
+
+```bash
+caffeinate -dimsu
+```
+
+如果机器睡眠或测试账户的完整图形会话被结束，bridge 就不会继续处理队列。
+
+### 7.2 建立独立测试账户
+
+在“系统设置 → 用户与群组”中：
+
+1. 新建账户。
+2. 用户名建议固定为 `godot-test`。
+3. 类型选择“标准”，不要授予管理员权限。
+4. 不使用主账户密码，不登录个人 Apple ID。
+5. 首次登录后清理桌面、通知和 Dock，关闭 Handoff、通用剪贴板和通知预览。
+
+随后必须至少登录一次 `godot-test`。LaunchAgent 是图形会话服务，只在测试
+账户有活动图形会话时工作。之后可以用快速用户切换回到主账户，但不要直接
+“注销”测试账户；完全注销会结束该图形会话。
+
+### 7.3 安装 Godot
+
+使用 Godot 官方 `4.7.2-stable`：
+
+1. 下载 universal macOS 版和对应 export templates。
+2. 按 [`SECURITY.md`](SECURITY.md) 校验 SHA-256 / SHA-512。
+3. 把 Godot 放到构建脚本读取的位置，或设置 `GODOT_BIN`：
+
+```bash
+export GODOT_BIN="/path/to/Godot.app/Contents/MacOS/Godot"
+```
+
+4. 在 Godot 中安装完全同版本的 export templates。
+5. 验证：
+
+```bash
+"$GODOT_BIN" --version
+```
+
+版本必须与项目的 `export_presets.cfg`、导出模板和构建 manifest 一致。
+
+### 7.4 安装 CuaDriver
+
+1. 从 Cua 官方 release 安装 `cua-driver-rs-v0.35.4`。
+2. 将 `CuaDriver.app` 安装到 `/Applications/CuaDriver.app`。
+3. 校验官方 checksum、代码签名和 Gatekeeper：
+
+```bash
+shasum -a 256 /path/to/downloaded-archive
+codesign --verify --deep --strict /Applications/CuaDriver.app
+spctl --assess --type execute --verbose=4 /Applications/CuaDriver.app
+```
+
+4. 关闭持久化遥测：
+
+```bash
+/Applications/CuaDriver.app/Contents/MacOS/cua-driver telemetry disable
+```
+
+不要把主账户目录、浏览器数据或密码库交给测试账户读取。
+
+### 7.5 在主账户准备共享目录
+
+从项目根目录执行：
+
+```bash
+cd "<REPO_ROOT>"
+./automation/godot/prepare-shared.sh
+```
+
+脚本会原子安装：
+
+- bridge
+- GUI 测试脚本
+- 提交任务脚本
+- 登录安装器
+- 重启脚本
+- 联系表生成器
+
+然后建立 CuaDriver 的稳定入口：
+
+```bash
+mkdir -p /Users/Shared/godot-playtest/runtime/bin
+ln -sfn \
+  /Applications/CuaDriver.app/Contents/MacOS/cua-driver \
+  /Users/Shared/godot-playtest/runtime/bin/cua-driver
+```
+
+检查结构：
+
+```bash
+ls -ld /Users/Shared/godot-playtest/{queue,processed,results,builds,runtime}
+```
+
+### 7.6 在 `godot-test` 账户授权并安装 LaunchAgent
+
+先切到 `godot-test`，在该账户终端执行：
+
+```bash
+/Users/Shared/godot-playtest/runtime/install-bridge-login.command
+```
+
+macOS 可能弹出 Accessibility、Screen Recording 或 direct capture 授权。
+只允许 CuaDriver 当前提示的可执行文件 / App，不要顺手给 Full Disk Access。
+
+授权后检查：
+
+```bash
+/Users/Shared/godot-playtest/runtime/bin/cua-driver \
+  call check_permissions
+```
+
+期望至少满足：
+
+```json
+{"accessibility": true, "screen_recording": true}
+```
+
+再检查 LaunchAgent：
+
+```bash
+launchctl print "gui/$(id -u)/com.codex.godot-playtest"
+```
+
+状态应为已加载并运行。错误日志位置：
+
+```text
+~/Library/Logs/godot-playtest-bridge.err.log
+```
+
+### 7.7 恢复日常使用
+
+安装和授权完成后：
+
+1. 保持 `godot-test` 已登录但非当前控制台。
+2. 用快速用户切换回到主账户。
+3. 不要反复登录/注销测试账户。
+4. 机器重启后，再登录一次 `godot-test` 启动 LaunchAgent，然后切回主账户。
+
+主账户上的共享脚本、构建和结果读取通常不需要 sudo。只有跨账户重启
+LaunchAgent 的 `restart-bridge.command` 需要管理员授权。
+
+---
+
+## 8. bridge 的工作方式
+
+参考实现位于：
+
+- `automation/godot/bridge.sh`
+- `automation/godot/submit-card-playtest.sh`
+- `automation/godot/cua-playtest-cards.sh`
+- `automation/godot/build.sh`
+- `automation/godot/publish-build.sh`
+
+### 8.1 发布候选构建
+
+构建阶段先运行普通 Headless 测试，再导出：
+
+```bash
+./godot-court/check.sh
+./automation/godot/build.sh
+```
+
+构建生成：
+
+- 已 ad-hoc 签名的 `.app`
+- manifest
+- executable SHA-256
+- PCK SHA-256
+- build ID
+
+然后发布：
+
+```bash
+./automation/godot/publish-build.sh "<ABSOLUTE_MANIFEST_PATH>"
+```
+
+发布脚本会：
+
+- 拒绝不安全的 app 名和 build ID。
+- 重新计算 executable/PCK SHA。
+- 复制到共享 `builds/`。
+- 发布后移除写权限。
+- 用临时文件 + rename 原子更新 `latest.json` 和 `card-latest.json`。
+
+测试账户不会从主账户项目目录直接启动构建。
+
+### 8.2 提交测试
+
+由主账户执行：
+
+```bash
+./automation/godot/submit-card-playtest.sh
+```
+
+某个确定性界面：
+
+```bash
+./automation/godot/submit-card-playtest.sh --demo=detail
+```
+
+脚本会：
+
+1. 读取 `card-latest.json`。
+2. 验证 app 和 manifest 还存在。
+3. 创建结果目录。
+4. 用临时 JSON + rename 投递任务。
+5. 轮询 `result.json`。
+6. 输出 PASS / FAIL、错误和结果目录。
+
+默认最长等待约 180 秒；bridge 单任务默认 170 秒。可用环境变量调整：
+
+```bash
+GODOT_PLAYTEST_TIMEOUT=240 \
+GODOT_PLAYTEST_JOB_TIMEOUT=230 \
+./automation/godot/submit-card-playtest.sh
+```
+
+### 8.3 单实例领取
+
+bridge 使用 lock 目录保证同一时刻只处理一个 GUI 任务。每个任务：
+
+1. 检查 `mode=background` 和 `allow_background=true`。
+2. 只接受安全字符组成的 job ID 和 demo 名。
+3. 写入 `processed/` 作为领取记录。
+4. 检查 result、app、manifest 都在共享目录允许的范围内。
+5. 比对 job 与 manifest 的 executable/PCK SHA。
+6. 用独立 process group 启动测试。
+7. 超时先 `SIGTERM`，再次超时 `SIGKILL`。
+8. 测试后关闭该 app 实例。
+
+这解决的是：重复任务、半写文件、旧构建指针、错误构建和挂死进程。
+
+---
+
+## 9. GUI 测试脚本具体做了什么
+
+参考脚本 `cua-playtest-cards.sh` 的默认完整流程：
+
+1. 检查当前用户在 `godot-test`。
+2. 检查 CuaDriver。
+3. 检查 app/manifest 和 SHA。
+4. 检查 Accessibility + Screen Recording。
+5. 记录测试前 `/dev/console` 用户。
+6. 通过 bundle ID 查找并关闭旧游戏 PID。
+7. 用 `open -n -g` 启动真实 app。
+8. 用 test-mode 参数建立状态、截图和测试输入文件。
+9. 查找 Godot 主窗口和 window ID。
+10. 建立一次窗口坐标上下文；这个隐藏帧不作为验收证据。
+11. 通过游戏自渲染截图输出真实 1280×720 PNG。
+12. 用 Accessibility 找按钮和控件 token。
+13. 用 Tab / Enter 打开药草园详情。
+14. 用非法拖放验证红框反馈和状态不变。
+15. 将米莎拖到药草园。
+16. 将青枝种子拖到药草园。
+17. 触发“培育”。
+18. 验证体力、药草和 action 状态。
+19. 打开保存面板、保存槽位并验证成功文本。
+20. 重新打开进度面板并读档。
+21. 验证药草、体力和桌面状态恢复。
+22. 记录测试后控制台用户。
+23. 生成联系表、vision 摘要和 result。
+24. 清理 PID、临时截图上下文和测试输入文件。
+
+脚本没有写死卡牌屏幕坐标。游戏 test-mode 导出每个控件的窗口矩形，测试脚本
+读取矩形中心后再拖动。布局调整后，测试不需要跟着手改像素坐标。
+
+---
+
+## 10. 应用需要提供的测试能力
+
+为了达到可重复、低模型消耗的 GUI 测试，游戏本身最好提供以下 test-mode
+能力。它们只能在本机测试进程开启，不能进入正常玩家路径。
+
+### 10.1 状态文件
+
+例：
+
+```text
+--test-mode --test-state=/shared/result/state.json
+```
+
+状态应包含：
+
+- 当前 UI 页面。
+- 关键数值。
+- 已放置对象。
+- 操作成功 / 失败。
+- 聚焦控件和 Accessibility 名称。
+- 可用控件的真实窗口矩形。
+
+### 10.2 应用自渲染截图
+
+不要让 Agent 直接依赖当前活动桌面截图。游戏可在 test-mode 下轮询一个
+request 文件，并从自身 viewport 输出 PNG：
+
+```text
+--capture-request=/shared/result/capture.request
+```
+
+这样即使主账户正在操作别的窗口，也能得到目标游戏自己的稳定帧。
+
+### 10.3 Canvas 输入桥
+
+例：
+
+```json
+{
+  "type": "drag",
+  "id": "random-safe-id",
+  "from": [100, 200],
+  "to": [600, 300],
+  "steps": 64,
+  "hold_ms": 1200
+}
+```
+
+游戏应：
+
+1. 只在 test-mode 轮询请求文件。
+2. 验证坐标范围和 ID。
+3. 产生真实按下、移动、释放 InputEvent。
+4. 让正常拖放代码处理。
+5. 写 ack 和性能指标。
+6. 删除请求，避免重复执行。
+
+长拖放截图时，释放后仍立刻 ack 会产生时序竞争。参考实现会在释放前保持
+一段可控的 `hold_ms`，让隔离截图完成；空闲测试状态不能阻塞实际玩家输入。
+
+### 10.4 Accessibility
+
+所有主要按钮、菜单和弹窗应有可读、唯一的名称。自绘 Canvas 不一定天然拥有
+完整 AX 树，因此坐标输入桥和状态断言必须补足，不能只靠 AX。
+
+---
+
+## 11. 结果目录和证据格式
+
+典型结果目录：
+
+```text
+results/cards-YYYYMMDD-HHMMSS-PID/
+├── contact-sheet.jpg
+├── result.json
+├── vision.json
+├── state.json
+├── actions.jsonl
+├── cua-permissions.json
+├── window.json
+├── raw-index.json
+├── bridge.log
+└── raw/
+```
+
+### 11.1 `contact-sheet.jpg`
+
+这是给模型和人工快速查看的唯一默认视觉证据。参考脚本只组合必要的关键帧，
+例如：
+
+- 桌面初始态。
+- 详情页。
+- 合法拖放中的状态。
+- 非法拖放拒绝态。
+- 培育结果。
+- 保存结果。
+- 读档结果。
+
+### 11.2 `result.json`
+
+主要字段：
+
+```json
+{
+  "status": "passed",
+  "error": "",
+  "mode": "background-cards",
+  "app_sha256": "<sha>",
+  "pck_sha256": "<sha>",
+  "console_unchanged": true,
+  "final_state": {},
+  "actions": [],
+  "artifacts": []
+}
+```
+
+验收至少应满足：
+
+- `status == "passed"`
+- `console_unchanged == true`
+- `console_user_before` 和 `console_user_after` 都不是 `godot-test`；
+  否则说明测试账户占了当前控制台，虽然前台没有切走，但并未处于后台隔离状态
+- 输入构建 SHA 与 manifest 一致
+- 关键状态断言通过
+- 联系表存在且可读
+- 没有把 GUI 测试声称为 Headless 测试
+
+### 11.3 `vision.json`
+
+给测试 Agent 的紧凑摘要，通常只保留：
+
+- status
+- error
+- build 指纹
+- 当前 UI
+- 关键数值
+- placements
+- 保存状态
+- 最近动作
+
+### 11.4 `raw/`
+
+私有原始 PNG。权限为测试账户私有。
+
+默认规则：
+
+- 测试 Agent 不遍历 `raw/`。
+- 不把全部 RAW 图发给视觉模型。
+- 只有用户明确指定某一张原图时才读取。
+- 分享前必须重新评估其中是否含个人桌面、通知或存档信息。
+
+---
+
+## 12. 测试 Agent 的低 Token 协议
+
+推荐把以下规则写进 Agent 的系统级项目规则或项目 `AGENTS.md`：
+
+1. 先在脚本里跑 Headless 功能和性能测试，不消耗视觉 Token。
+2. GUI 测试只通过 bridge 提交，不在主账户启动 Godot。
+3. 测试 Agent 不修改源码。
+4. 每轮最多读取一张图：结果目录的 `contact-sheet.jpg`。
+5. 不遍历、不读取 `raw/`。
+6. 先读 `result.json.error`、关键状态和动作摘要，再看图。
+7. PASS 只需简短证据；FAIL 只返回：
+   - 精确复现步骤
+   - 预期
+   - 实际
+   - 结果目录
+   - 一张联系表
+8. 不把完整聊天记录、完整源码、完整日志或十几张截图传给测试模型。
+9. 最多修复两轮；第二轮仍失败就停止，避免无限循环。
+
+如果需要接入两个原生 Agent：
+
+- Developer：只实现、跑脚本、修 Bug、提交 Git。
+- Tester：独立上下文，只验收候选构建，不改源码。
+- 主管：拆分任务、检查 diff、发布、合并和最终交付。
+- 不增加第三个管理 Agent。
+
+线程 ID、模型密钥和本机账户信息属于本地配置，不应写进可分享文档。
+
+---
+
+## 13. 标准开发闭环
+
+```text
+需求
+  ↓
+Developer 在独立工作树修改
+  ↓
+Headless 测试
+  ↓
+Developer 提交 Git
+  ↓
+主管检查 diff
+  ↓
+build + publish
+  ↓
+隔离 GUI Tester
+  ↓
+PASS? ──否──> 精确复现回 Developer（最多两轮）
+  │
+ 是
+  ↓
+主管再跑主仓检查
+  ↓
+合并、发布、交付
+```
+
+不要让 Developer 自己宣布 GUI PASS；也不要让 Tester 直接改源码。两者分离
+才能避免“改到自己满意”而绕过独立验收。
+
+---
+
+## 14. 日常操作清单
+
+### 每次测试前
+
+- [ ] `godot-test` 处于已登录、非当前控制台状态。
+- [ ] 机器没有睡眠。
+- [ ] `card-latest.json` 指向本次候选构建。
+- [ ] 主仓工作树没有未提交的意外源码。
+- [ ] `check.sh` 已通过。
+
+### 每次测试后
+
+- [ ] `result.json.status` 是 `passed`。
+- [ ] `console_unchanged` 是 `true`。
+- [ ] 测试前后当前控制台都不是 `godot-test`。
+- [ ] 构建 SHA 与 manifest 一致。
+- [ ] 关键玩法状态满足断言。
+- [ ] 查看过一张 `contact-sheet.jpg`。
+- [ ] 没有把 `raw/` 发送给模型。
+- [ ] FAIL 时保存最短复现，不贴整份日志。
+
+---
+
+## 15. 常见故障排查
+
+### 15.1 没有任何授权弹窗
+
+1. 确认正在 `godot-test`，不是主账户。
+2. 运行：
+
+```bash
+/Users/Shared/godot-playtest/runtime/bin/cua-driver \
+  call check_permissions
+```
+
+3. 如果返回值仍是 false，打开：
+
+```text
+系统设置 → 隐私与安全性 → 辅助功能
+系统设置 → 隐私与安全性 → 屏幕与系统音频录制
+```
+
+4. 只给 CuaDriver 当前提示的可执行文件 / App 授权。
+5. 完全退出并重新打开 CuaDriver 后重试。
+
+系统升级后 TCC 权限可能被重置；重新执行安装器并按需重新授权。
+
+### 15.2 LaunchAgent 没活下来
+
+检查：
+
+```bash
+launchctl print "gui/$(id -u)/com.codex.godot-playtest"
+sed -n '1,160p' ~/Library/Logs/godot-playtest-bridge.err.log
+```
+
+然后在 `godot-test` 重新执行安装器。不要只手动运行 bridge，因为登录后自恢复
+依赖 LaunchAgent。
+
+### 15.3 主账户执行测试后队列不处理
+
+- 测试账户是否仍登录？
+- 是否完全注销了测试账户？
+- 机器是否睡眠？
+- LaunchAgent 是否被系统更新、权限重置或安全软件关闭？
+- 队列是否有权限写入 `/Users/Shared/godot-playtest/queue`？
+
+### 15.4 按钮能点，但角色或卡牌不动
+
+不要继续盲目加大 CUA 全局事件。检查：
+
+1. 游戏是否启用了应用内 test-input。
+2. 坐标是否来自游戏导出的真实控件矩形。
+3. 事件是否通过 Godot 的 `Viewport.push_input()` 进入正常输入管线。
+4. 是否在背景会话里错误地使用了全局 Canvas 事件。
+5. 是否只验证“无报错”，却没有验证游戏状态变化。
+
+### 15.5 截图只有一两张或漏掉拒绝态
+
+- 检查 `result.json.error`。
+- 检查 `actions.jsonl` 的时间顺序。
+- 长按截图是否在释放 ack 之前完成。
+- `hold_ms` 是否足够。
+- 联系表是否存在。
+- 联系表生成时是否只找到了预期的关键帧。
+
+### 15.6 `413 Payload Too Large`
+
+通常不是模型“不会看图”，而是一次请求带了太多大图。
+
+- 一次最多一张联系表。
+- 不要附加十几张 1280×720 PNG。
+- 先传状态摘要和错误文本。
+- 只有联系表无法判断时，才在用户明确要求下查看单张原图。
+
+### 15.7 构建指纹不匹配
+
+重新发布当前 manifest。不要绕过 SHA 检查，也不要让测试账户直接运行主目录里
+未发布的 app。
+
+### 15.8 截图尺寸不是 1280×720
+
+参考脚本有明确尺寸门槛。检查：
+
+- 游戏窗口是否被系统缩放。
+- test-mode 的参考窗口尺寸是否被覆盖。
+- app 是否启动失败后打开了错误窗口。
+- Retina 缩放是否由应用自渲染逻辑正确处理。
+
+### 15.9 重启后不自动测
+
+重启后至少登录一次 `godot-test`，使该用户的 GUI LaunchAgent 启动。然后可以
+切回主账户。若希望更自动化，可配置开机后测试账户快速登录，但这会降低物理
+隔离和安全性，应谨慎评估。
+
+---
+
+## 16. 迁移到另一个游戏项目时要改什么
+
+这份实现带有 Looped Vows 的 bundle ID、demo 名和状态断言。迁移时至少替换：
+
+1. app bundle ID。
+2. test-mode 启动参数。
+3. `state.json` 字段和业务断言。
+4. 可识别的 Accessibility 名称。
+5. 控件矩形导出。
+6. Canvas 输入桥协议。
+7. 截图关键帧列表。
+8. 默认 1280×720 或项目实际分辨率。
+9. `contact-sheet.swift` 的排序和数量。
+10. tester prompt 和两轮修复上限。
+
+输入桥、文件权限、原子发布、SHA 校验、单实例 bridge 和单图证据协议可以复用。
+
+---
+
+## 17. 公开发布与签名边界
+
+本 GUI 测试构建通常是本机 ad-hoc 签名，适合内部验证。
+
+它不能自动证明：
+
+- Developer ID 签名有效。
+- Apple notarization 已完成。
+- 已 stapling。
+- 能通过最终用户的 Gatekeeper。
+
+若要对外分发，必须在发布脚本中单独完成 Apple Developer ID 签名、notarytool
+提交和 stapling。相关证书、Apple ID 专用密码、Team ID 和 notary profile 必须
+由发布者安全提供，不能进入仓库、共享测试目录或本文档。
+
+---
+
+## 18. 新机验收清单
+
+全部满足后才算“新机部署成功”：
+
+- [ ] `godot-test` 是非管理员标准用户。
+- [ ] Godot 版本与项目 export templates 完全一致。
+- [ ] CuaDriver 来自官方 release，checksum / 签名已验证。
+- [ ] CuaDriver 遥测已关闭。
+- [ ] Accessibility 和 Screen Recording 均返回 true。
+- [ ] LaunchAgent 已安装并持续运行。
+- [ ] bridge 能在主账户保持当前控制台时运行。
+- [ ] 真实 app 能被启动并找到唯一窗口。
+- [ ] 应用自渲染截图是实际目标尺寸。
+- [ ] CuaDriver 能读取 AX 树并投递 Tab / Enter。
+- [ ] Canvas 拖动能改变游戏真实状态。
+- [ ] 合法与非法操作都有截图和状态断言。
+- [ ] 培育、保存、读档等关键业务链路可验证。
+- [ ] `console_unchanged == true`。
+- [ ] 测试期间当前控制台保持为主账户，而不是 `godot-test`。
+- [ ] `result.json.status == "passed"` 且错误为空。
+- [ ] 每轮测试 Agent 最多只看一张联系表。
+- [ ] 原始截图不会默认离开测试机。
+- [ ] 重启后重新登录测试账户即可恢复 bridge。
+- [ ] 对外分享只包含脱敏摘要和必要图片。
+
+只要其中一项不满足，就应明确报告未验证，不能把“脚本存在”当作“已经跑通”。
